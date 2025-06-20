@@ -29,8 +29,21 @@ message['event'] = event name
 message['event_arguments'] = event data
 message['aggregate'] - entity state, could be none
 message['aggregate_id']
+
+
+Flow:
+    * Commend is received
+    * Commend class is created
+    * Aggregate_id is retrieved from command (id could be None)
+    * Aggregate state snapshot is retreived from snapshot store or None
+    * Aggregate events are retrievend from event store starting from latest sequence number of loaded snapshot
+    or 0 in case there is no snapshot
+    * event message is issued for every loaded event, result is stored as current aggregate state
+    * Commend message is issued with command pyload and current aggregate state
+    * Events retrurned by command are persisted to event store
 """
 
+import asyncio
 from dataclasses import dataclass
 import json
 from logging import getLogger
@@ -64,6 +77,26 @@ class CommandMessage:
         return self.command_class.split(".")[-1]
 
 
+class CommandHandler:
+    def __init__(self) -> None:
+        self.request_sent = asyncio.Event()
+        self.request_queue = asyncio.Queue()
+        self.response_queue = asyncio.Queue()
+        self.response_received = asyncio.Event()
+
+    async def __call__(self, msg) -> Any:
+        print(msg)
+        command = CommandMessage(**json.loads(msg.data))
+        print(command.create_payload())
+
+        aggregate_id = command.aggregate_id
+        # retreive aggregate state from repository
+        # self.repository.get_by_id(aggregate_id)
+
+
+class MessageHandler: ...
+
+
 class EsFeature(ServerFeature):
     def __init__(self, server):
         self.server = server
@@ -74,10 +107,6 @@ class EsFeature(ServerFeature):
     async def startup(self):
         logger.info("Starting EventSource feature")
         self.nc: Client = await nats.connect("tls://localhost:4222")
-        self.js: JetStreamContext = self.nc.jetstream()
-        self.locks = await self.js.create_key_value(
-            bucket=f"{self.server.lifespan.app_name}_locks", ttl=10
-        )
 
         async def handle_command(msg):
             print(msg)
