@@ -31,6 +31,34 @@ class MethodRequest:
         self.kwargs: Dict = request.get("kwargs", dict())
 
 
+class CommandRequest:
+    def __init__(self) -> None:
+        self.command = None
+        self.payload = dict()
+        self.aggregate = None
+        self.metadata = dict()
+
+    async def __call__(self, scope, receive, send) -> Any:
+        request = await receive()
+        self.command = request.get("command")
+        self.payload = request.get("payload", {})
+        self.aggregate = request.get("aggregate")
+        self.metadata = request.get("metadata", {})
+
+
+class EventApplyRequest:
+    def __init__(self) -> None:
+        self.event = None
+        self.payload = dict()
+        self.aggregate = None
+
+    async def __call__(self, scope, receive, send) -> Any:
+        request = await receive()
+        self.event = request.get("event")
+        self.payload = request.get("payload", {})
+        self.aggregate = request.get("aggregate")
+
+
 class MethodRoute(BaseRoute):
     def __init__(self, method_name, handler) -> None:
         self.method_name = method_name
@@ -48,11 +76,51 @@ class MethodRoute(BaseRoute):
         return await self.handler(*request.args, **request.kwargs)
 
 
+class CommandRoute(BaseRoute):
+    def __init__(self, aggregate_type, command_name, handler) -> None:
+        self.aggregate_type = aggregate_type
+        self.command_name = command_name
+        self.handler = Bean(handler)
+
+    def matches(self, scope, command_name) -> bool:
+        if scope["type"] == "es" and scope["aggregate_type"] == self.aggregate_type:
+            return command_name == self.command_name
+        return False
+
+    async def handle(self, scope, receive, send) -> None:
+        request = CommandRequest()
+        await request(scope, receive, send)
+        self.handler.add_context(scope["state"])
+        return await self.handler(
+            request.payload, request.aggregate, metadata=request.metadata
+        )
+
+
+class AggregateEventRoute(BaseRoute):
+    def __init__(self, aggregate_type, event_name, handler) -> None:
+        self.aggregate_type = aggregate_type
+        self.event_name = event_name
+        self.handler = Bean(handler)
+
+    def matches(self, scope, event_name) -> bool:
+        if scope["type"] == "es" and scope["aggregate_type"] == self.aggregate_type:
+            return event_name == self.event_name
+        return False
+
+    async def handle(self, scope, receive, send) -> None:
+        request = EventApplyRequest()
+        await request(scope, receive, send)
+        self.handler.add_context(scope["state"])
+        return await self.handler(request.payload, request.aggregate)
+
+
 class Nuts:
     def __init__(self, name: str, *, lifespan: Lifespan = None) -> None:
         self.name = name
         self.lifespan_context = lifespan
         self.method_routes = list()
+        self.command_routes = list()
+        self.event_routes = list()
 
     def add_method(self, name, handler):
         """
@@ -79,15 +147,27 @@ class Nuts:
         """
         pass
 
-    def add_command(self):
+    def add_command(self, aggregate_type: str, command_name: str, handler):
         """
-        Registed command handler
+        Register command handler for aggregate.
         """
+        self.register_command(aggregate_type, command_name, handler)
 
-    def add_aggregate_event(self):
+    def add_aggregate_event(self, aggregate_type: str, event_name: str, handler):
         """
-        Register aggregate event handler that return new aggregate state
+        Register aggregate event handler that returns new aggregate state.
         """
+        self.register_aggregate_event(aggregate_type, event_name, handler)
+
+    def register_command(self, aggregate_type: str, command_name: str, handler):
+        self.command_routes.append(
+            CommandRoute(aggregate_type, command_name, handler)
+        )
+
+    def register_aggregate_event(self, aggregate_type: str, event_name: str, handler):
+        self.event_routes.append(
+            AggregateEventRoute(aggregate_type, event_name, handler)
+        )
 
     async def lifespan(self, scope, receive, send) -> Any:
         await receive()
@@ -105,7 +185,7 @@ class Nuts:
 
     async def __call__(self, scope, receive, send) -> Any:
         logger.debug(f"Scope: {scope}")
-        assert scope["type"] in ("rpc", "lifespan")
+        assert scope["type"] in ("rpc", "lifespan", "es")
 
         if scope["type"] == "lifespan":
             await self.lifespan(scope, receive, send)
@@ -133,3 +213,52 @@ class Nuts:
                     "headers": {"status": "404"},
                 }
             )
+            return
+
+        if scope["type"] == "es":
+            request = await receive()
+            request_type = request.get("type")
+
+            if request_type == "es.command.request":
+                async def receive_request():
+                    return request
+
+                for route in self.command_routes:
+                    if route.matches(scope, request.get("command")):
+                        response = await route.handle(scope, receive_request, send)
+                        await send(
+                            {
+                                "type": "es.command.response",
+                                "events": response,
+                            }
+                        )
+                        return
+                await send(
+                    {
+                        "type": "es.command.error",
+                        "error": {"code": "command_not_found", "message": "Not found"},
+                    }
+                )
+                return
+
+            if request_type == "es.event.request":
+                async def receive_request():
+                    return request
+
+                for route in self.event_routes:
+                    if route.matches(scope, request.get("event")):
+                        response = await route.handle(scope, receive_request, send)
+                        await send(
+                            {
+                                "type": "es.event.response",
+                                "aggregate": response,
+                            }
+                        )
+                        return
+                await send(
+                    {
+                        "type": "es.event.error",
+                        "error": {"code": "event_not_found", "message": "Not found"},
+                    }
+                )
+                return

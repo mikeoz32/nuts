@@ -1,37 +1,32 @@
+from __future__ import annotations
+
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 import json
-from typing import Dict, Generic, List, Protocol, TypeVar
-from uuid import UUID
+from typing import Any, Dict, Iterable, List, Protocol
+
 from nats import NATS
 from nats.aio.msg import Msg
-from nats.js.api import ConsumerConfig, DeliverPolicy
+from nats.js.api import ConsumerConfig, DeliverPolicy, RetentionPolicy, StreamConfig
+from nats.js.errors import NotFoundError
 
-from nuts.server.importtools import create_class, fqn
 
-DEP = TypeVar("_DEP")
+class ConcurrencyError(RuntimeError):
+    pass
 
 
 @dataclass
-class DomainEvent(Generic[DEP]):
+class EventEnvelope:
     aggregate_id: str
+    aggregate_type: str
+    name: str
+    payload: Dict[str, Any]
+    sequence: int
+    metadata: Dict[str, Any] | None = None
 
 
-@dataclass
-class StoredEvent:
-    payload: DomainEvent
-    event_type: str
-    sequence: int = 0
-
-    def from_dict(data: Dict):
-        print(data)
-        event_type = data.get("event_type")
-        event_cls = create_class(event_type)
-        return StoredEvent(payload=event_cls(**data["payload"]), event_type=event_type)
-
-
-def make_subject(aggregate_id: str) -> str:
-    return f"aggregate.{aggregate_id}"
+def make_subject(app: str, aggregate_type: str, aggregate_id: str) -> str:
+    return f"{app}.es.event.{aggregate_type}.{aggregate_id}"
 
 
 def deliver_policy_for_seq(seq: int) -> DeliverPolicy:
@@ -44,15 +39,13 @@ class StreamReader:
         self.jsm = nc.jsm()
         self._stream = stream
 
-    async def read_messages(self, aggregate_id: str, seq: int = 0):
-        subj = make_subject(aggregate_id)
-
-        msgs_count = await self.count_messages(subj) - seq
+    async def read_messages(self, subject: str, stream_seq: int = 0):
+        msgs_count = await self.count_messages(subject)
 
         if msgs_count <= 0:
             return []
 
-        async with self.pull_subscribe(subj, seq) as sub:
+        async with self.pull_subscribe(subject, stream_seq) as sub:
             return await sub.fetch(msgs_count)
 
     async def count_messages(self, subject: str):
@@ -60,12 +53,12 @@ class StreamReader:
         return info.state.messages
 
     @asynccontextmanager
-    async def pull_subscribe(self, subj: str, seq: int = 0):
+    async def pull_subscribe(self, subject: str, stream_seq: int = 0):
         sub = await self.js.pull_subscribe(
-            subj,
+            subject,
             stream=self._stream,
             config=ConsumerConfig(
-                opt_start_seq=seq, deliver_policy=deliver_policy_for_seq(seq)
+                opt_start_seq=stream_seq, deliver_policy=deliver_policy_for_seq(stream_seq)
             ),
         )
 
@@ -73,53 +66,110 @@ class StreamReader:
 
         await sub.unsubscribe()
 
-    async def _stream_info(self):
-        self.jsm.add_stream
-
 
 class StreamWriter:
     def __init__(self, nc: NATS, stream: str) -> None:
         self.js = nc.jetstream()
         self._stream = stream
 
-    async def write(self, aggregate_id: str, data: bytes):
-        await self.js.publish(make_subject(aggregate_id), data, stream=self._stream)
+    async def write(self, subject: str, data: bytes):
+        await self.js.publish(subject, data, stream=self._stream)
 
 
 class SerializerProtocol(Protocol):
-    def serialize(self, event: StoredEvent) -> bytes: ...
-    def deserialize(self, data: bytes) -> StoredEvent: ...
+    def serialize(self, event: EventEnvelope) -> bytes: ...
+    def deserialize(self, data: bytes) -> EventEnvelope: ...
 
 
 class JsonSerializer(SerializerProtocol):
-    def serialize(self, event: StoredEvent) -> bytes:
+    def serialize(self, event: EventEnvelope) -> bytes:
         return json.dumps(asdict(event)).encode("utf-8")
 
-    def deserialize(self, data: bytes) -> StoredEvent:
-        return json.loads(data)
+    def deserialize(self, data: bytes) -> EventEnvelope:
+        payload = json.loads(data)
+        return EventEnvelope(**payload)
 
 
-class NutsEventStore:
-    def __init__(self, nc: NATS, name: str) -> None:
-        self.reader = StreamReader(nc, name)
-        self.writer = StreamWriter(nc, name)
+class EventStore:
+    def __init__(self, nc: NATS, stream: str, app_name: str) -> None:
+        self.app_name = app_name
+        self.stream = stream
+        self.reader = StreamReader(nc, stream)
+        self.writer = StreamWriter(nc, stream)
+        self.jsm = nc.jsm()
         self.serializer: SerializerProtocol = JsonSerializer()
 
-    async def publish(self, event: DomainEvent):
-        aggregate_id = event.aggregate_id
-        stored_event = StoredEvent(payload=event, event_type=fqn(event))
-        data = self.serializer.serialize(stored_event)
-        await self.writer.write(aggregate_id, data)
+    async def ensure_stream(
+        self,
+        *,
+        subjects: Iterable[str],
+        retention: RetentionPolicy = RetentionPolicy.LIMITS,
+        max_age: float | None = None,
+        max_bytes: int | None = None,
+    ) -> None:
+        try:
+            await self.jsm.stream_info(self.stream)
+            return
+        except NotFoundError:
+            pass
 
-    async def all(self):
-        return self.process_messages(await self.reader.read_messages("*"))
+        config = StreamConfig(
+            name=self.stream,
+            subjects=list(subjects),
+            retention=retention,
+            max_age=max_age,
+            max_bytes=max_bytes,
+        )
+        await self.jsm.add_stream(config)
 
-    async def read(self, aggregate_id: str, seq: int = 0):
-        return await self.reader.read_messages(aggregate_id, seq)
+    async def current_version(self, aggregate_type: str, aggregate_id: str) -> int:
+        subject = make_subject(self.app_name, aggregate_type, aggregate_id)
+        try:
+            info = await self.jsm.stream_info(self.stream, subjects_filter=subject)
+        except NotFoundError:
+            return 0
+        return info.state.messages
 
-    def process_messages(self, messages: List[Msg]):
-        return list(map(self.process_message, messages))
+    async def append(
+        self,
+        aggregate_type: str,
+        aggregate_id: str,
+        *,
+        expected_version: int | None,
+        events: List[Dict[str, Any]],
+        metadata: Dict[str, Any] | None = None,
+    ) -> List[EventEnvelope]:
+        current_version = await self.current_version(aggregate_type, aggregate_id)
+        if expected_version is not None and current_version != expected_version:
+            raise ConcurrencyError(
+                f"Expected version {expected_version}, got {current_version}"
+            )
 
-    def process_message(self, message: Msg):
-        data = self.serializer.deserialize(message.data)
-        return StoredEvent.from_dict(data)
+        stored_events: List[EventEnvelope] = []
+        sequence = current_version
+        subject = make_subject(self.app_name, aggregate_type, aggregate_id)
+        for event in events:
+            sequence += 1
+            envelope = EventEnvelope(
+                aggregate_id=aggregate_id,
+                aggregate_type=aggregate_type,
+                name=event["name"],
+                payload=event.get("payload", {}),
+                sequence=sequence,
+                metadata=metadata,
+            )
+            data = self.serializer.serialize(envelope)
+            await self.writer.write(subject, data)
+            stored_events.append(envelope)
+        return stored_events
+
+    async def load(
+        self, aggregate_type: str, aggregate_id: str, *, from_sequence: int = 0
+    ) -> List[EventEnvelope]:
+        subject = make_subject(self.app_name, aggregate_type, aggregate_id)
+        messages = await self.reader.read_messages(subject)
+        events = [self.process_message(message) for message in messages]
+        return [event for event in events if event.sequence > from_sequence]
+
+    def process_message(self, message: Msg) -> EventEnvelope:
+        return self.serializer.deserialize(message.data)
