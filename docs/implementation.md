@@ -250,3 +250,55 @@ Projections are intentionally out of scope for this phase.
 - **what:** Add a “Getting started” snippet for creating aggregates.
   - **why:** Reduces onboarding friction for new contributors.
   - **DoD:** Documentation includes a minimal aggregate example and command flow.
+
+---
+
+## Follow-up Plan: Gaps & Next Iteration
+
+This plan captures the missing areas identified after the initial ES implementation.
+Each item is framed as a task with **what / why / DoD** to keep it actionable.
+
+### Task F.1: Projection & read-model pipeline
+- **what:** Introduce a projection feature that consumes ES events and updates read models.
+  - **why:** ES without projections limits query/read use cases and downstream consumers.
+  - **DoD:** A `nuts/server/projections` feature exists, can subscribe to event subjects,
+    and persists a basic projection with a checkpoint (`last_sequence`).
+
+### Task F.2: Snapshot policy scheduling
+- **what:** Make snapshot policy configurable and support more than a fixed interval.
+  - **why:** Large aggregates need flexible snapshot frequency for performance.
+  - **DoD:** Snapshot policy supports `every_n_events`, optional `max_age`, and can be
+    configured via ES feature settings.
+
+### Task F.3: Schema evolution & validation
+- **what:** Add versioned command/event schemas with validation and migration hooks.
+  - **why:** ES systems must evolve schemas without breaking consumers.
+  - **DoD:** Command/event envelopes include `schema_version`, and validators/migrations
+    can be registered per aggregate/event type.
+
+### Task F.4: Concurrency conflict handling strategy
+- **what:** Add retry/backoff and conflict resolution hooks for optimistic concurrency.
+  - **why:** Production ES workloads need more than a single conflict error.
+  - **DoD:** Feature supports configurable retries and exposes a conflict hook for
+    domain-specific resolution.
+
+### Task F.5: Error taxonomy & standard error envelopes
+- **what:** Standardize error codes and add structured error responses.
+  - **why:** Clients need machine-readable, stable error contracts.
+  - **DoD:** Error envelope uses a documented taxonomy and is covered by tests.
+
+### Task F.6: Observability (logs & metrics)
+- **what:** Add structured logs and basic metrics for ES command processing.
+  - **why:** ES flows are difficult to debug without telemetry.
+  - **DoD:** Logs include command id, aggregate id/type, timing, and outcome; metrics
+    track throughput, errors, and append latency.
+
+### Task F.7: Aggregate API ergonomics
+- **what:** Provide typed helpers/decorators for aggregates, commands, and events.
+  - **why:** Reduces boilerplate and enforces consistent aggregate APIs.
+  - **DoD:** A minimal `Aggregate` base and `@command`/`@event` helpers exist with docs.
+
+### Task F.8: Client-side ES convenience APIs
+- **what:** Add client helpers for event replay and subscriptions.
+  - **why:** ES users need read-side helpers for CQRS workflows.
+  - **DoD:** `NutsClient.es` supports `load_events` and `subscribe` with examples.
