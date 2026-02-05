@@ -87,6 +87,9 @@ class EsMessageHandler:
         *,
         timeout: float,
         snapshot_interval: int,
+        conflict_retries: int,
+        conflict_backoff: float,
+        conflict_handler=None,
     ) -> None:
         self.app = app
         self.nc = nc
@@ -95,6 +98,9 @@ class EsMessageHandler:
         self.snapshot_store = snapshot_store
         self.timeout = timeout
         self.snapshot_interval = snapshot_interval
+        self.conflict_retries = conflict_retries
+        self.conflict_backoff = conflict_backoff
+        self.conflict_handler = conflict_handler
 
     async def __call__(self, msg) -> Any:
         try:
@@ -106,63 +112,43 @@ class EsMessageHandler:
                 "state": self.state,
             }
 
-            snapshot = await self.snapshot_store.load(
-                command.aggregate_type, command.aggregate_id
-            )
-            aggregate_state = snapshot.state if snapshot else None
-            last_sequence = snapshot.last_sequence if snapshot else 0
-
-            stored_events = await self.event_store.load(
-                command.aggregate_type, command.aggregate_id, from_sequence=last_sequence
-            )
-            aggregate_state = await self.apply_events(
-                scope, aggregate_state, stored_events
-            )
-
-            expected_version = (
-                command.expected_version
-                if command.expected_version is not None
-                else last_sequence + len(stored_events)
-            )
-
-            command_response = await self.call_app(
-                scope,
-                {
-                    "type": "es.command.request",
-                    "command": command.command,
-                    "payload": command.payload,
-                    "aggregate": aggregate_state,
-                    "metadata": command.metadata,
-                },
-            )
-            if command_response.get("type") == "es.command.error":
-                await self.publish_error(msg.reply, command_response.get("error", {}))
-                return
-
-            events = command_response.get("events", [])
-            try:
-                stored_new_events = await self.event_store.append(
-                    command.aggregate_type,
-                    command.aggregate_id,
-                    expected_version=expected_version,
-                    events=events,
-                    metadata=command.metadata,
+            stored_new_events: List[EventEnvelope] = []
+            new_version = 0
+            for attempt in range(self.conflict_retries + 1):
+                aggregate_state, expected_version, events, error = (
+                    await self.prepare_command(scope, command)
                 )
-            except ConcurrencyError as exc:
-                await self.publish_error(
-                    msg.reply,
-                    {"code": "conflict_error", "message": str(exc)},
+                if error:
+                    await self.publish_error(msg.reply, error)
+                    return
+                try:
+                    stored_new_events = await self.event_store.append(
+                        command.aggregate_type,
+                        command.aggregate_id,
+                        expected_version=expected_version,
+                        events=events,
+                        metadata=command.metadata,
+                    )
+                except ConcurrencyError as exc:
+                    if await self.should_retry(conflict_error=exc, attempt=attempt):
+                        await self.backoff(attempt)
+                        continue
+                    await self.publish_error(
+                        msg.reply,
+                        {"code": "conflict_error", "message": str(exc)},
+                    )
+                    return
+                aggregate_state = await self.apply_events(
+                    scope, aggregate_state, stored_new_events
                 )
+                new_version = (
+                    stored_new_events[-1].sequence
+                    if stored_new_events
+                    else expected_version
+                )
+                break
+            else:
                 return
-
-            aggregate_state = await self.apply_events(
-                scope, aggregate_state, stored_new_events
-            )
-            new_version = (
-                stored_new_events[-1].sequence
-                if stored_new_events
-                else expected_version
-            )
 
             if (
                 self.snapshot_interval
@@ -197,6 +183,64 @@ class EsMessageHandler:
                 msg.reply,
                 {"code": "internal_error", "message": str(exc)},
             )
+
+    async def prepare_command(self, scope: Dict[str, Any], command: CommandMessage):
+        snapshot = await self.snapshot_store.load(
+            command.aggregate_type, command.aggregate_id
+        )
+        aggregate_state = snapshot.state if snapshot else None
+        last_sequence = snapshot.last_sequence if snapshot else 0
+
+        stored_events = await self.event_store.load(
+            command.aggregate_type, command.aggregate_id, from_sequence=last_sequence
+        )
+        aggregate_state = await self.apply_events(scope, aggregate_state, stored_events)
+
+        expected_version = (
+            command.expected_version
+            if command.expected_version is not None
+            else last_sequence + len(stored_events)
+        )
+
+        command_response = await self.call_app(
+            scope,
+            {
+                "type": "es.command.request",
+                "command": command.command,
+                "payload": command.payload,
+                "aggregate": aggregate_state,
+                "metadata": command.metadata,
+            },
+        )
+        if command_response.get("type") == "es.command.error":
+            return (
+                aggregate_state,
+                expected_version,
+                [],
+                command_response.get("error", {"code": "invalid_command"}),
+            )
+
+        return (
+            aggregate_state,
+            expected_version,
+            command_response.get("events", []),
+            None,
+        )
+
+    async def should_retry(self, *, conflict_error: Exception, attempt: int) -> bool:
+        if attempt >= self.conflict_retries:
+            return False
+        if self.conflict_handler is None:
+            return True
+        result = self.conflict_handler(conflict_error, attempt)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return bool(result)
+
+    async def backoff(self, attempt: int) -> None:
+        if self.conflict_backoff <= 0:
+            return
+        await asyncio.sleep(self.conflict_backoff * (attempt + 1))
 
     async def call_app(self, scope: Dict[str, Any], request_message: Dict[str, Any]):
         request_queue: asyncio.Queue = asyncio.Queue()
@@ -271,6 +315,9 @@ class EsFeature(ServerFeature):
         self.stream_name = "NUTS_ES"
         self.snapshot_interval = 50
         self.timeout = 1.0
+        self.conflict_retries = 2
+        self.conflict_backoff = 0.05
+        self.conflict_handler = None
         self.requests = set()
 
     async def startup(self):
@@ -293,6 +340,9 @@ class EsFeature(ServerFeature):
                 self.snapshot_store,
                 timeout=self.timeout,
                 snapshot_interval=self.snapshot_interval,
+                conflict_retries=self.conflict_retries,
+                conflict_backoff=self.conflict_backoff,
+                conflict_handler=self.conflict_handler,
             )
             request_task = asyncio.create_task(handler(msg))
             request_task.add_done_callback(self.requests.discard)
