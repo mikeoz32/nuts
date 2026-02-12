@@ -110,8 +110,10 @@ class CommandRoute(BaseRoute):
         request = CommandRequest()
         await request(scope, receive, send)
         self.handler.add_context(scope["state"])
+        metadata = dict(request.metadata)
+        metadata.setdefault("aggregate_id", scope.get("aggregate_id"))
         return await self.handler(
-            request.payload, request.aggregate, metadata=request.metadata
+            request.payload, request.aggregate, metadata=metadata
         )
 
 
@@ -218,6 +220,14 @@ class Nuts:
         Register aggregate event handler that returns new aggregate state.
         """
         self.register_aggregate_event(aggregate_type, event_name, handler)
+
+    def add_aggregate(self, aggregate_cls):
+        """
+        Register aggregate class with decorated command/event handlers.
+        """
+        from nuts.aggregate import register_aggregate
+
+        register_aggregate(self, aggregate_cls)
 
     def register_command(self, aggregate_type: str, command_name: str, handler):
         self.command_routes.append(
