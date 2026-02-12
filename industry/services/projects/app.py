@@ -64,3 +64,32 @@ class WikiPageAggregate(Aggregate):
 
 app.add_aggregate(ProjectAggregate)
 app.add_aggregate(WikiPageAggregate)
+
+
+async def project_view_projection(
+    payload,
+    projection,
+    metadata=None,
+    aggregate_id=None,
+    sequence=None,
+    aggregate_type=None,
+):
+    view = projection or {"id": aggregate_id, "type": aggregate_type}
+    if aggregate_type == "projects":
+        if "name" in payload:
+            view["name"] = payload["name"]
+        if "owner_id" in payload:
+            view["owner_id"] = payload["owner_id"]
+        if "description" in payload:
+            view["description"] = payload["description"]
+    if aggregate_type == "wiki_pages":
+        view.setdefault("wiki", {})
+        view["wiki"][payload["title"]] = payload["content"]
+    return view
+
+
+app.add_projection("project_views", "projects", "ProjectCreated", project_view_projection)
+app.add_projection("project_views", "projects", "ProjectRenamed", project_view_projection)
+app.add_projection(
+    "project_views", "wiki_pages", "WikiPageUpdated", project_view_projection
+)

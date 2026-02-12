@@ -55,3 +55,24 @@ class ContractAggregate(Aggregate):
 
 app.add_aggregate(ProposalAggregate)
 app.add_aggregate(ContractAggregate)
+
+
+async def hiring_view_projection(
+    payload,
+    projection,
+    metadata=None,
+    aggregate_id=None,
+    sequence=None,
+    aggregate_type=None,
+):
+    view = projection or {"id": aggregate_id, "type": aggregate_type}
+    view.update(payload)
+    return view
+
+
+app.add_projection(
+    "proposal_views", "proposals", "ProposalSubmitted", hiring_view_projection
+)
+app.add_projection(
+    "contract_views", "contracts", "ContractSigned", hiring_view_projection
+)

@@ -51,3 +51,33 @@ class UserAggregate(Aggregate):
 
 app.add_aggregate(TenantAggregate)
 app.add_aggregate(UserAggregate)
+
+
+async def tenant_view_projection(
+    payload,
+    projection,
+    metadata=None,
+    aggregate_id=None,
+    sequence=None,
+    aggregate_type=None,
+):
+    view = projection or {"id": aggregate_id, "type": aggregate_type}
+    view.update(payload)
+    return view
+
+
+async def user_view_projection(
+    payload,
+    projection,
+    metadata=None,
+    aggregate_id=None,
+    sequence=None,
+    aggregate_type=None,
+):
+    view = projection or {"id": aggregate_id, "type": aggregate_type}
+    view.update(payload)
+    return view
+
+
+app.add_projection("tenant_views", "tenants", "TenantCreated", tenant_view_projection)
+app.add_projection("user_views", "users", "UserRegistered", user_view_projection)

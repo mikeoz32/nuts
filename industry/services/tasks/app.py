@@ -51,3 +51,21 @@ class TaskAggregate(Aggregate):
 
 
 app.add_aggregate(TaskAggregate)
+
+
+async def task_view_projection(
+    payload,
+    projection,
+    metadata=None,
+    aggregate_id=None,
+    sequence=None,
+    aggregate_type=None,
+):
+    view = projection or {"id": aggregate_id, "type": aggregate_type}
+    view.update(payload)
+    return view
+
+
+app.add_projection("task_views", "tasks", "TaskCreated", task_view_projection)
+app.add_projection("task_views", "tasks", "TaskAssigned", task_view_projection)
+app.add_projection("task_views", "tasks", "TaskStatusChanged", task_view_projection)
