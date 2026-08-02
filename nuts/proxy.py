@@ -53,15 +53,19 @@ class AggregateProxy:
     async def command(self, command: Dict[str, Any]):
         nc = await self.get_connection()
 
-        payload_fqn = command.__class__.__module__ + "." + command.__class__.__name__
-
         message = CommandMessage(
-            aggregate_id="1", payload=command, command_class=payload_fqn
+            aggregate_type=command["aggregate_type"],
+            aggregate_id=command["aggregate_id"],
+            command=command["command"],
+            payload=command.get("payload", {}),
+            metadata=command.get("metadata", {}),
+            expected_version=command.get("expected_version"),
+            id=command.get("id"),
         )
 
         data = json.dumps(asdict(message))
         response = await nc.request(
-            f"{self.service_name}.es.command.{command.__class__.__name__}",
+            f"{self.service_name}.es.command.{command['aggregate_type']}",
             bytes(data, "utf-8"),
         )
         agglog.info(response)

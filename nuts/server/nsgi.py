@@ -5,6 +5,7 @@ from types import FrameType
 import nats
 import signal
 from nuts.server.es.feature import EsFeature
+from nuts.server.projections.feature import ProjectionFeature
 import sys
 import threading
 from logging import getLogger
@@ -38,7 +39,7 @@ class NsgiServer:
 
         self._captured_signals = []
 
-        self.features = [RpcFeature(self), EsFeature(self)]
+        self.features = [RpcFeature(self), EsFeature(self), ProjectionFeature(self)]
 
     def run(self, app):
         """

@@ -29,17 +29,28 @@ pachages = ["nuts"]
 
 [tool.hatch.envs.default.scripts]
 server = "python example/service.py"
-test = "pytest {args}"
+test = "pytest --cov=nuts --cov-report=term-missing {args}"
 
 [tool.hatch.envs.default]
 dev-mode = true
 skip-install = false 
 dependencies = [
   "pytest",
-  "pytest-asyncio"
+  "pytest-asyncio",
+  "pytest-cov",
+  "pytest-docker"
 ]
 
 
 [tool.pytest.ini_options]
 addopts = "--capture=sys"
 asyncio_default_fixture_loop_scope = "function"
+
+[tool.coverage.run]
+branch = true
+omit = [
+  "nuts/actor.py"
+]
+
+[tool.coverage.report]
+show_missing = true
