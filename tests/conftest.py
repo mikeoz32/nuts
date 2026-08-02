@@ -1,16 +1,16 @@
 import asyncio
 from contextlib import suppress
+from pathlib import Path
 import socket
-import subprocess
-import tempfile
 import time
+from typing import AsyncGenerator
 
 import nats
 from nats.js.api import StreamConfig
 import pytest
 import pytest_asyncio
 
-from industry.organization.service import EventPublisher
+from industry_backup.organization.service import EventPublisher
 
 
 def _is_port_open(host: str, port: int) -> bool:
@@ -28,38 +28,35 @@ def _wait_for_port(host: str, port: int, timeout: float = 5.0) -> bool:
     return False
 
 
-@pytest.fixture(scope="session", autouse=True)
-def nats_server():
+@pytest.fixture(scope="session")
+def docker_compose_file() -> list[str]:
+    return [str(Path(__file__).with_name("docker-compose.yml"))]
+
+
+@pytest.fixture(scope="session")
+def nats_server(docker_services):
     host = "127.0.0.1"
     port = 4223
+    if _is_port_open(host, port):
+        return True
 
-    process = None
-    temp_dir = None
-    if not _is_port_open(host, port):
-        temp_dir = tempfile.TemporaryDirectory()
-        process = subprocess.Popen(
-            ["nats-server", "-js", "-p", str(port), "-sd", temp_dir.name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+    try:
+        docker_services.wait_until_responsive(
+            timeout=25.0,
+            pause=0.2,
+            check=lambda: _is_port_open(host, port),
         )
+    except Exception:
+        return False
 
-        if not _wait_for_port(host, port):
-            process.terminate()
-            process.wait(timeout=5)
-            temp_dir.cleanup()
-            pytest.skip("NATS server did not start in time")
-
-    yield
-
-    if process:
-        process.terminate()
-        process.wait(timeout=5)
-    if temp_dir:
-        temp_dir.cleanup()
+    return _wait_for_port(host, port, timeout=5.0)
 
 
 @pytest_asyncio.fixture(scope="function")
-async def nc():
+async def nc(nats_server) -> AsyncGenerator:
+    if not nats_server:
+        pytest.skip("NATS with JetStream is not available for integration tests")
+
     try:
         nc = await asyncio.wait_for(
             nats.connect(
@@ -71,6 +68,7 @@ async def nc():
         )
     except Exception as exc:
         pytest.skip(f"NATS not available: {exc}")
+        return
     try:
         js = nc.jetstream()
         for _ in range(10):
@@ -87,7 +85,7 @@ async def nc():
 
 
 @pytest_asyncio.fixture(scope="function")
-async def test_stream(nc) -> str:
+async def test_stream(nc) -> AsyncGenerator[str, None]:
     STREAM_NAME = "test_stream"
 
     jsm = nc.jsm()

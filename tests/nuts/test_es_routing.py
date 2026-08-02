@@ -10,7 +10,7 @@ async def test_es_command_route_handles_command():
 
     async def handle_create(payload, aggregate, metadata=None):
         assert aggregate is None
-        assert metadata == {"trace_id": "abc"}
+        assert metadata == {"trace_id": "abc", "aggregate_id": "order-1"}
         return [{"name": "Created", "payload": {"value": payload["value"]}}]
 
     app.add_command("orders", "Create", handle_create)
@@ -82,6 +82,4 @@ async def test_es_event_route_applies_event():
 
     await app(scope, receive, send)
 
-    assert responses == [
-        {"type": "es.event.response", "aggregate": {"value": 10}}
-    ]
+    assert responses == [{"type": "es.event.response", "aggregate": {"value": 10}}]

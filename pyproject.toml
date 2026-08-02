@@ -37,7 +37,8 @@ skip-install = false
 dependencies = [
   "pytest",
   "pytest-asyncio",
-  "pytest-cov"
+  "pytest-cov",
+  "pytest-docker"
 ]
 
 
